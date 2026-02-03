@@ -9,7 +9,7 @@ services:
   - type: web
     name: pulse-api
     runtime: python
-    plan: free
+    plan: starter
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
@@ -34,10 +34,8 @@ services:
         value: "3.11.4"
 
   # Frontend Static Site
-  - type: web
+  - type: static
     name: pulse-frontend
-    runtime: static
-    plan: free
     rootDir: frontend
     buildCommand: npm install && npm run build
     staticPublishPath: dist
