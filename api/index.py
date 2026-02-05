@@ -126,8 +126,9 @@ _bearer = HTTPBearer(auto_error=False)
 
 def verify_google_token(token: str) -> dict | None:
     try:
+        audience = settings.GOOGLE_CLIENT_ID or None
         return google_id_token.verify_oauth2_token(
-            token, GoogleRequest(), settings.GOOGLE_CLIENT_ID
+            token, GoogleRequest(), audience
         )
     except Exception:
         return None
