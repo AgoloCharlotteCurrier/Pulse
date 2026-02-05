@@ -53,7 +53,9 @@ class Base(DeclarativeBase):
 # Handle Vercel Postgres URL format
 db_url = settings.DATABASE_URL
 if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+    db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif db_url.startswith("postgresql://"):
+    db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
 # On Vercel the filesystem is read-only except for /tmp
 if "sqlite" in db_url and os.getenv("VERCEL"):
