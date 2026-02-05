@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import requests as http_requests
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -126,6 +127,21 @@ def verify_google_token(token: str) -> dict | None:
         return google_id_token.verify_oauth2_token(
             token, GoogleRequest(), settings.GOOGLE_CLIENT_ID
         )
+    except Exception:
+        return None
+
+
+def verify_google_access_token(token: str) -> dict | None:
+    """Verify a Google access token by calling the userinfo endpoint."""
+    try:
+        resp = http_requests.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json()
     except Exception:
         return None
 
@@ -353,7 +369,10 @@ app.add_middleware(
 
 @app.post("/api/auth/google", response_model=AuthResponse)
 def google_login(body: GoogleTokenRequest, db: Session = Depends(get_db)):
+    # Try ID token first, then fall back to access token (OAuth implicit flow)
     payload = verify_google_token(body.token)
+    if payload is None:
+        payload = verify_google_access_token(body.token)
     if payload is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google token")
 
