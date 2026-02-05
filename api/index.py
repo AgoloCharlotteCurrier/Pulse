@@ -54,9 +54,14 @@ db_url = settings.DATABASE_URL
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
+# On Vercel the filesystem is read-only except for /tmp
+if "sqlite" in db_url and os.getenv("VERCEL"):
+    db_url = "sqlite:////tmp/pulse.db"
+
 engine = create_engine(
     db_url,
     connect_args={"check_same_thread": False} if "sqlite" in db_url else {},
+    pool_pre_ping=True,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -93,8 +98,18 @@ class Run(Base):
     user = relationship("User", back_populates="runs")
 
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+_tables_created = False
+
+
+def _ensure_tables():
+    """Create tables on first use, not at import time."""
+    global _tables_created
+    if not _tables_created:
+        try:
+            Base.metadata.create_all(bind=engine)
+            _tables_created = True
+        except Exception:
+            pass  # DB might not be ready yet; will fail at query time with a clear error
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,6 +158,7 @@ def decode_jwt(token: str) -> dict | None:
 
 
 def get_db():
+    _ensure_tables()
     db = SessionLocal()
     try:
         yield db
