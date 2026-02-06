@@ -6,316 +6,243 @@ import {
   XResult,
 } from "./types";
 
-function getSourceCount(depth: string): number {
-  switch (depth) {
-    case "quick":
-      return 10;
-    case "deep":
-      return 60;
-    default:
-      return 25;
-  }
+// Depth configs: how many items to request from each source
+const DEPTH_CONFIG: Record<string, { min: number; max: number }> = {
+  quick: { min: 10, max: 15 },
+  default: { min: 20, max: 35 },
+  deep: { min: 50, max: 70 },
+};
+
+function getDepthConfig(depth: string) {
+  return DEPTH_CONFIG[depth] || DEPTH_CONFIG.default;
 }
 
-function stripMarkdown(text: string): string {
-  return text
-    .replace(/\*\*([^*]*)\*\*/g, "$1")
-    .replace(/\*([^*]*)\*/g, "$1")
-    .replace(/`([^`]*)`/g, "$1")
-    .replace(/^#+\s*/gm, "")
-    .trim();
-}
+// ---------------------------------------------------------------------------
+// JSON extraction helpers
+// ---------------------------------------------------------------------------
 
-function extractJsonArray(text: string): any[] | null {
-  let jsonStr = text.trim();
+function extractJsonObject(text: string): any | null {
+  const cleaned = text.trim();
 
   // Extract from markdown code blocks
-  const codeBlockMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-  if (codeBlockMatch) {
-    jsonStr = codeBlockMatch[1].trim();
-  }
+  const codeBlockMatch = cleaned.match(
+    /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/
+  );
+  const jsonStr = codeBlockMatch ? codeBlockMatch[1].trim() : cleaned;
 
+  // Try direct parse
   try {
-    const parsed = JSON.parse(jsonStr);
-    if (Array.isArray(parsed)) return parsed;
-    for (const key of ["results", "data", "posts", "tweets", "items"]) {
-      if (Array.isArray(parsed[key])) return parsed[key];
-    }
-    return null;
+    return JSON.parse(jsonStr);
+  } catch {}
+
+  // Try to find a JSON object with "items" key
+  const objMatch = jsonStr.match(/\{[\s\S]*"items"[\s\S]*\}/);
+  if (objMatch) {
+    try {
+      return JSON.parse(objMatch[0]);
+    } catch {}
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Response text extraction (works for both OpenAI and xAI Responses API)
+// ---------------------------------------------------------------------------
+
+function extractOutputText(output: any[]): string {
+  return (
+    output
+      .filter((b: any) => b.type === "message")
+      .flatMap((b: any) => b.content || [])
+      .filter((c: any) => c.type === "output_text")
+      .map((c: any) => c.text)
+      .join("\n") || ""
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reddit: Enrichment via Reddit's public JSON API
+// ---------------------------------------------------------------------------
+
+async function fetchRedditThreadJson(
+  url: string
+): Promise<any | null> {
+  try {
+    // Extract path from Reddit URL
+    const parsed = new URL(url);
+    if (!parsed.hostname.includes("reddit.com")) return null;
+
+    let path = parsed.pathname.replace(/\/$/, "");
+    if (!path.endsWith(".json")) path += ".json";
+
+    const res = await fetch(`https://www.reddit.com${path}?raw_json=1`, {
+      headers: {
+        "User-Agent": "Pulse/1.0 (social-research-tool)",
+        Accept: "application/json",
+      },
+    });
+    if (!res.ok) return null;
+    return await res.json();
   } catch {
-    // Try to find a JSON array in the text
-    const arrayMatch = jsonStr.match(/\[[\s\S]*\]/);
-    if (arrayMatch) {
-      try {
-        const parsed = JSON.parse(arrayMatch[0]);
-        if (Array.isArray(parsed)) return parsed;
-      } catch {}
-    }
     return null;
   }
 }
 
-function parseRedditResults(text: string): RedditResult[] {
-  // Try JSON parsing first
-  const jsonArray = extractJsonArray(text);
-  if (jsonArray && jsonArray.length > 0) {
-    return jsonArray
-      .map((item: any) => {
-        const title = stripMarkdown(
-          String(item.title || item.post_title || "")
-        );
-        if (!title || title.length < 3) return null;
+function parseRedditThreadData(data: any): {
+  title: string;
+  author: string;
+  score: number;
+  numComments: number;
+  upvoteRatio: number;
+  createdUtc: number;
+  selftext: string;
+  subreddit: string;
+} | null {
+  if (!Array.isArray(data) || data.length < 1) return null;
 
-        return {
-          id: uuidv4(),
-          title,
-          subreddit: String(item.subreddit || "unknown").replace(/^r\//, ""),
-          url:
-            item.url ||
-            `https://www.reddit.com/search/?q=${encodeURIComponent(title)}`,
-          upvotes:
-            parseInt(
-              String(item.upvotes || item.score || item.points || 0).replace(
-                /,/g,
-                ""
-              )
-            ) || 0,
-          commentCount:
-            parseInt(
-              String(
-                item.comment_count ||
-                  item.comments ||
-                  item.commentCount ||
-                  0
-              ).replace(/,/g, "")
-            ) || 0,
-          relevanceScore: parseFloat(
-            String(
-              item.relevance_score ||
-                item.relevance ||
-                item.relevanceScore ||
-                Math.round(60 + Math.random() * 35)
-            )
-          ),
-          snippet: stripMarkdown(
-            String(item.snippet || item.summary || item.text || item.body || "")
-          ).slice(0, 300),
-          author: String(item.author || item.username || "unknown").replace(
-            /^u\//,
-            ""
-          ),
-          createdAt: new Date().toISOString(),
-        } as RedditResult;
-      })
-      .filter((r): r is RedditResult => r !== null);
-  }
+  const children = data[0]?.data?.children;
+  if (!children?.length) return null;
 
-  // Fallback: improved regex parsing with markdown stripping
-  const results: RedditResult[] = [];
-  const blocks = text.split(/\n(?=\d+[\.\)]\s)/).filter((b) => b.trim());
+  const sub = children[0]?.data;
+  if (!sub) return null;
 
-  for (const block of blocks) {
-    // Skip preamble blocks that don't start with a numbered item
-    if (!/^\d+[\.\)]\s/.test(block.trim())) continue;
-
-    const cleaned = stripMarkdown(block);
-
-    const titleMatch = cleaned.match(
-      /title[:\s]+["']?([^"'\n]{5,})/i
-    );
-    const subredditMatch = cleaned.match(/(?:r\/|subreddit[:\s]*)(\w+)/i);
-    const urlMatch = cleaned.match(
-      /(https?:\/\/(?:www\.)?reddit\.com\S+)/i
-    );
-    const upvoteMatch = cleaned.match(
-      /(\d[\d,]*)\s*(?:upvotes?|points?|score)/i
-    );
-    const commentMatch = cleaned.match(/(\d[\d,]*)\s*comments?/i);
-    const authorMatch = cleaned.match(/(?:u\/|author[:\s]*)(\w+)/i);
-    const relevanceMatch = cleaned.match(
-      /(?:relevance|score)[:\s]*(\d+(?:\.\d+)?)/i
-    );
-
-    const title =
-      titleMatch?.[1]?.trim() ||
-      cleaned
-        .replace(/^\d+[\.\)]\s*/, "")
-        .split("\n")[0]
-        .slice(0, 120)
-        .trim();
-    if (!title || title.length < 5) continue;
-
-    // Build snippet by removing metadata lines
-    const snippetLines = cleaned
-      .split("\n")
-      .filter(
-        (l) =>
-          !/^(title|subreddit|url|upvotes?|comments?|author|relevance|score|points)[:\s]/i.test(
-            l.trim()
-          ) && !/^\d+[\.\)]\s/.test(l.trim())
-      );
-    const snippet = snippetLines.join(" ").slice(0, 300).trim();
-
-    results.push({
-      id: uuidv4(),
-      title,
-      subreddit: subredditMatch?.[1] || "unknown",
-      url:
-        urlMatch?.[1] ||
-        `https://www.reddit.com/search/?q=${encodeURIComponent(title)}`,
-      upvotes: parseInt(upvoteMatch?.[1]?.replace(/,/g, "") || "0"),
-      commentCount: parseInt(commentMatch?.[1]?.replace(/,/g, "") || "0"),
-      relevanceScore: parseFloat(
-        relevanceMatch?.[1] || String(Math.round(60 + Math.random() * 35))
-      ),
-      snippet: snippet || cleaned.replace(/^\d+[\.\)]\s*/, "").slice(0, 300),
-      author: authorMatch?.[1] || "unknown",
-      createdAt: new Date().toISOString(),
-    });
-  }
-
-  return results;
+  return {
+    title: sub.title || "",
+    author: sub.author || "unknown",
+    score: sub.score ?? 0,
+    numComments: sub.num_comments ?? 0,
+    upvoteRatio: sub.upvote_ratio ?? 0,
+    createdUtc: sub.created_utc ?? 0,
+    selftext: (sub.selftext || "").slice(0, 300),
+    subreddit: sub.subreddit || "unknown",
+  };
 }
 
-function parseXResults(text: string): XResult[] {
-  // Try JSON parsing first
-  const jsonArray = extractJsonArray(text);
-  if (jsonArray && jsonArray.length > 0) {
-    return jsonArray
-      .map((item: any) => {
-        const tweetText = stripMarkdown(
-          String(
-            item.text || item.tweet || item.content || item.post_text || ""
-          )
-        ).slice(0, 280);
-        if (!tweetText || tweetText.length < 5) return null;
+async function enrichRedditItem(
+  item: { url: string; title: string; subreddit: string; relevance: number },
+): Promise<RedditResult> {
+  const threadData = await fetchRedditThreadJson(item.url);
+  const parsed = threadData ? parseRedditThreadData(threadData) : null;
 
-        const handle = String(
-          item.handle ||
-            item.author_handle ||
-            item.authorHandle ||
-            item.username ||
-            "unknown"
-        ).replace(/^@/, "");
-
-        return {
-          id: uuidv4(),
-          text: tweetText,
-          authorHandle: handle,
-          authorName: stripMarkdown(
-            String(
-              item.author_name ||
-                item.authorName ||
-                item.display_name ||
-                item.name ||
-                handle
-            )
-          ),
-          url:
-            item.url ||
-            item.link ||
-            `https://x.com/search?q=${encodeURIComponent(
-              tweetText.slice(0, 50)
-            )}`,
-          likes:
-            parseInt(
-              String(
-                item.likes || item.like_count || item.favorites || 0
-              ).replace(/,/g, "")
-            ) || 0,
-          reposts:
-            parseInt(
-              String(
-                item.reposts || item.repost_count || item.retweets || 0
-              ).replace(/,/g, "")
-            ) || 0,
-          replies:
-            parseInt(
-              String(
-                item.replies || item.reply_count || item.comments || 0
-              ).replace(/,/g, "")
-            ) || 0,
-          relevanceScore: parseFloat(
-            String(
-              item.relevance_score ||
-                item.relevance ||
-                item.relevanceScore ||
-                Math.round(60 + Math.random() * 35)
-            )
-          ),
-          createdAt: new Date().toISOString(),
-        } as XResult;
-      })
-      .filter((r): r is XResult => r !== null);
+  if (parsed) {
+    return {
+      id: uuidv4(),
+      title: parsed.title || item.title,
+      subreddit: parsed.subreddit || item.subreddit,
+      url: item.url,
+      upvotes: parsed.score,
+      commentCount: parsed.numComments,
+      relevanceScore: Math.round(item.relevance * 100),
+      snippet: parsed.selftext.slice(0, 300),
+      author: parsed.author,
+      createdAt: parsed.createdUtc
+        ? new Date(parsed.createdUtc * 1000).toISOString()
+        : new Date().toISOString(),
+    };
   }
 
-  // Fallback: improved regex parsing with markdown stripping
-  const results: XResult[] = [];
-  const blocks = text.split(/\n(?=\d+[\.\)]\s)/).filter((b) => b.trim());
+  // Fallback: return unenriched item
+  return {
+    id: uuidv4(),
+    title: item.title,
+    subreddit: item.subreddit,
+    url: item.url,
+    upvotes: 0,
+    commentCount: 0,
+    relevanceScore: Math.round(item.relevance * 100),
+    snippet: "",
+    author: "unknown",
+    createdAt: new Date().toISOString(),
+  };
+}
 
-  for (const block of blocks) {
-    // Skip preamble blocks
-    if (!/^\d+[\.\)]\s/.test(block.trim())) continue;
+// ---------------------------------------------------------------------------
+// Reddit: Discovery via OpenAI Responses API + web_search
+// ---------------------------------------------------------------------------
 
-    const cleaned = stripMarkdown(block);
+// Prompt adapted from last30days-skill (mvanhorn/last30days-skill)
+const REDDIT_SEARCH_PROMPT = `Find Reddit discussion threads about: {topic}
 
-    // Extract tweet text from a labeled field or use first line
-    const textMatch = cleaned.match(
-      /(?:tweet|post|text)[:\s]+["']([^"']{5,})["']/i
-    );
-    const handleMatch = cleaned.match(
-      /(?:handle|username)[:\s]*@?(\w{1,15})/i
-    );
-    const handleFallback = cleaned.match(/@(\w{1,15})/);
-    const nameMatch = cleaned.match(
-      /(?:display\s*name|author\s*name|name)[:\s]*["']?([^"'\n@]{2,})/i
-    );
-    const urlMatch = cleaned.match(
-      /(https?:\/\/(?:twitter\.com|x\.com)\S+)/i
-    );
-    const likesMatch = cleaned.match(
-      /(\d[\d,]*)\s*(?:likes?|hearts?|favou?rites?)/i
-    );
-    const repostMatch = cleaned.match(
-      /(\d[\d,]*)\s*(?:reposts?|retweets?|RTs?)/i
-    );
-    const repliesMatch = cleaned.match(
-      /(\d[\d,]*)\s*(?:replies|responses?)/i
-    );
-    const relevanceMatch = cleaned.match(
-      /(?:relevance|score)[:\s]*(\d+(?:\.\d+)?)/i
-    );
+STEP 1: EXTRACT THE CORE SUBJECT
+Get the MAIN NOUN/PRODUCT/TOPIC:
+- "best nano banana prompting practices" → "nano banana"
+- "killer features of clawdbot" → "clawdbot"
+DO NOT include "best", "top", "tips", "practices", "features" in your search.
 
-    const tweetText = (
-      textMatch?.[1] ||
-      cleaned
-        .replace(/^\d+[\.\)]\s*/, "")
-        .split("\n")[0]
-        .slice(0, 280)
-    ).trim();
-    if (!tweetText || tweetText.length < 5) continue;
+STEP 2: SEARCH BROADLY
+Search for the core subject on Reddit:
+1. "[core subject] site:reddit.com"
+2. "reddit [core subject]"
 
-    const handle = handleMatch?.[1] || handleFallback?.[1] || "unknown";
+Return as many relevant threads as you find.
 
-    results.push({
-      id: uuidv4(),
-      text: tweetText,
-      authorHandle: handle,
-      authorName: nameMatch?.[1]?.trim() || handle,
-      url:
-        urlMatch?.[1] ||
-        `https://x.com/search?q=${encodeURIComponent(tweetText.slice(0, 50))}`,
-      likes: parseInt(likesMatch?.[1]?.replace(/,/g, "") || "0"),
-      reposts: parseInt(repostMatch?.[1]?.replace(/,/g, "") || "0"),
-      replies: parseInt(repliesMatch?.[1]?.replace(/,/g, "") || "0"),
-      relevanceScore: parseFloat(
-        relevanceMatch?.[1] || String(Math.round(60 + Math.random() * 35))
+STEP 3: INCLUDE ALL MATCHES
+- Include ALL threads about the core subject
+- Set date to "YYYY-MM-DD" if you can determine it, otherwise null
+- DO NOT pre-filter aggressively - include anything relevant
+
+REQUIRED: URLs must contain "/r/" AND "/comments/"
+REJECT: developers.reddit.com, business.reddit.com
+
+Find {min_items}-{max_items} threads. Return MORE rather than fewer.
+
+Return JSON:
+{
+  "items": [
+    {
+      "title": "Thread title",
+      "url": "https://www.reddit.com/r/sub/comments/xyz/title/",
+      "subreddit": "subreddit_name",
+      "date": "YYYY-MM-DD or null",
+      "why_relevant": "Why relevant",
+      "relevance": 0.85
+    }
+  ]
+}`;
+
+function parseRedditDiscoveryResponse(response: any): Array<{
+  url: string;
+  title: string;
+  subreddit: string;
+  relevance: number;
+}> {
+  const text = extractOutputText(response.output || []);
+  const parsed = extractJsonObject(text);
+  const rawItems = parsed?.items || [];
+
+  const items: Array<{
+    url: string;
+    title: string;
+    subreddit: string;
+    relevance: number;
+  }> = [];
+
+  for (const item of rawItems) {
+    if (!item || typeof item !== "object") continue;
+
+    const url = String(item.url || "");
+    // Validate: must be a real Reddit thread URL with /r/ and /comments/
+    if (
+      !url.includes("reddit.com") ||
+      !url.includes("/r/") ||
+      !url.includes("/comments/")
+    ) {
+      continue;
+    }
+
+    items.push({
+      url,
+      title: String(item.title || "").trim(),
+      subreddit: String(item.subreddit || "").replace(/^r\//, ""),
+      relevance: Math.min(
+        1.0,
+        Math.max(0.0, parseFloat(String(item.relevance || 0.5)))
       ),
-      createdAt: new Date().toISOString(),
     });
   }
 
-  return results;
+  return items;
 }
 
 export async function searchReddit(
@@ -328,44 +255,147 @@ export async function searchReddit(
 
   try {
     const client = new OpenAI({ apiKey });
-    const count = getSourceCount(params.depth);
+    const { min, max } = getDepthConfig(params.depth);
 
+    const prompt = REDDIT_SEARCH_PROMPT.replace("{topic}", params.topic)
+      .replace("{min_items}", String(min))
+      .replace("{max_items}", String(max));
+
+    // Step 1: Discover Reddit thread URLs via web_search with domain filtering
     const response = await client.responses.create({
       model: "gpt-4o",
-      tools: [{ type: "web_search_preview" }],
-      input: `Search Reddit for discussions about "${params.topic}" from the last ${params.lookbackDays} days. Find up to ${count} relevant Reddit posts and threads.
+      tools: [
+        {
+          type: "web_search_preview" as any,
+          search_context_size: "high",
+        },
+      ],
+      input: prompt,
+    } as any);
 
-Return the results as a JSON array. Each object must have these fields:
-{
-  "title": "Post title",
-  "subreddit": "subreddit name without r/ prefix",
-  "url": "full reddit.com URL",
-  "upvotes": 0,
-  "comments": 0,
-  "author": "username without u/ prefix",
-  "relevance_score": 85,
-  "snippet": "Brief text preview of the discussion"
-}
+    const discoveredItems = parseRedditDiscoveryResponse(response);
 
-IMPORTANT: Return ONLY the JSON array with no surrounding text, markdown, or explanation. Focus on the most relevant and highly-engaged posts.`,
-    });
+    if (discoveredItems.length === 0) {
+      return { results: [] };
+    }
 
-    const text =
-      response.output
-        .filter((b): b is OpenAI.Responses.ResponseOutputMessage => b.type === "message")
-        .flatMap((b) => b.content)
-        .filter((c): c is OpenAI.Responses.ResponseOutputText => c.type === "output_text")
-        .map((c) => c.text)
-        .join("\n") || "";
+    // Step 2: Enrich each discovered thread with real data from Reddit's JSON API
+    const enrichPromises = discoveredItems
+      .slice(0, max)
+      .map((item) => enrichRedditItem(item));
 
-    const results = parseRedditResults(text);
-    return { results: results.length > 0 ? results : [] };
+    const results = await Promise.allSettled(enrichPromises);
+
+    const enrichedResults: RedditResult[] = results
+      .filter(
+        (r): r is PromiseFulfilledResult<RedditResult> =>
+          r.status === "fulfilled"
+      )
+      .map((r) => r.value);
+
+    return { results: enrichedResults };
   } catch (err) {
     return {
       results: [],
       error: `Reddit search failed: ${err instanceof Error ? err.message : "Unknown error"}`,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// X/Twitter: Discovery via xAI Responses API + x_search
+// ---------------------------------------------------------------------------
+
+// Prompt adapted from last30days-skill (mvanhorn/last30days-skill)
+const X_SEARCH_PROMPT = `You have access to real-time X (Twitter) data. Search for posts about: {topic}
+
+Focus on posts from the last {lookback_days} days. Find {min_items}-{max_items} high-quality, relevant posts.
+
+IMPORTANT: Return ONLY valid JSON in this exact format, no other text:
+{
+    "items": [
+        {
+            "text": "Post text content (truncated if long)",
+            "url": "https://x.com/user/status/...",
+            "author_handle": "username",
+            "author_name": "Display Name",
+            "date": "YYYY-MM-DD or null if unknown",
+            "engagement": {
+                "likes": 100,
+                "reposts": 25,
+                "replies": 15
+            },
+            "why_relevant": "Brief explanation of relevance",
+            "relevance": 0.85
+        }
+    ]
+}
+
+Rules:
+- relevance is 0.0 to 1.0 (1.0 = highly relevant)
+- date must be YYYY-MM-DD format or null
+- engagement can be null if unknown
+- Include diverse voices/accounts if applicable
+- Prefer posts with substantive content, not just links
+- Only include REAL posts you found through search`;
+
+function parseXDiscoveryResponse(response: any): XResult[] {
+  const text = extractOutputText(response.output || []);
+  const parsed = extractJsonObject(text);
+  const rawItems = parsed?.items || [];
+
+  const results: XResult[] = [];
+
+  for (const item of rawItems) {
+    if (!item || typeof item !== "object") continue;
+
+    const url = String(item.url || "");
+    if (!url) continue;
+
+    const handle = String(item.author_handle || "")
+      .trim()
+      .replace(/^@/, "");
+
+    const text = String(item.text || "").trim().slice(0, 500);
+    if (!text || text.length < 5) continue;
+
+    // Parse engagement
+    const eng = item.engagement;
+    const likes =
+      eng && typeof eng === "object"
+        ? parseInt(String(eng.likes || 0)) || 0
+        : 0;
+    const reposts =
+      eng && typeof eng === "object"
+        ? parseInt(String(eng.reposts || 0)) || 0
+        : 0;
+    const replies =
+      eng && typeof eng === "object"
+        ? parseInt(String(eng.replies || 0)) || 0
+        : 0;
+
+    const relevance = Math.min(
+      1.0,
+      Math.max(0.0, parseFloat(String(item.relevance || 0.5)))
+    );
+
+    results.push({
+      id: uuidv4(),
+      text,
+      authorHandle: handle || "unknown",
+      authorName: String(item.author_name || item.display_name || handle || "unknown").trim(),
+      url,
+      likes,
+      reposts,
+      replies,
+      relevanceScore: Math.round(relevance * 100),
+      createdAt: item.date
+        ? new Date(item.date).toISOString()
+        : new Date().toISOString(),
+    });
+  }
+
+  return results;
 }
 
 export async function searchX(
@@ -381,40 +411,22 @@ export async function searchX(
       apiKey,
       baseURL: "https://api.x.ai/v1",
     });
-    const count = getSourceCount(params.depth);
+    const { min, max } = getDepthConfig(params.depth);
 
-    const response = await client.chat.completions.create({
+    const prompt = X_SEARCH_PROMPT.replace("{topic}", params.topic)
+      .replace("{lookback_days}", String(params.lookbackDays))
+      .replace("{min_items}", String(min))
+      .replace("{max_items}", String(max));
+
+    // Use Responses API with x_search tool for real X/Twitter search
+    const response = await client.responses.create({
       model: "grok-3",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a research assistant that searches X/Twitter for relevant posts. Always return results as a raw JSON array with no markdown formatting, no code blocks, and no surrounding text.",
-        },
-        {
-          role: "user",
-          content: `Search X/Twitter for posts about "${params.topic}" from the last ${params.lookbackDays} days. Find up to ${count} relevant posts.
+      tools: [{ type: "x_search" } as any],
+      input: [{ role: "user", content: prompt }] as any,
+    } as any);
 
-Return the results as a JSON array. Each object must have these fields:
-{
-  "text": "Tweet text content",
-  "handle": "username without @ prefix",
-  "author_name": "Display name",
-  "url": "full x.com URL",
-  "likes": 0,
-  "reposts": 0,
-  "replies": 0,
-  "relevance_score": 85
-}
-
-IMPORTANT: Return ONLY the JSON array with no surrounding text, markdown, or explanation. Focus on the most relevant and highly-engaged posts.`,
-        },
-      ],
-    });
-
-    const text = response.choices?.[0]?.message?.content || "";
-    const results = parseXResults(text);
-    return { results: results.length > 0 ? results : [] };
+    const results = parseXDiscoveryResponse(response);
+    return { results };
   } catch (err) {
     return {
       results: [],
