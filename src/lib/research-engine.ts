@@ -420,7 +420,7 @@ export async function searchX(
 
     // Use Responses API with x_search tool for real X/Twitter search
     const response = await client.responses.create({
-      model: "grok-3",
+      model: "grok-4",
       tools: [{ type: "x_search" } as any],
       input: [{ role: "user", content: prompt }] as any,
     } as any);
